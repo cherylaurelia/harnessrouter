@@ -7999,7 +7999,8 @@ class _RespTranslator:
                                  ("cache_write_tokens", "cache_write_tokens")):
                     if u.get(src):
                         self.usage[dst] = u[src]
-            if not self.any_text and payload.get("text"):
+            # An error result's text is the turn's reason, which `error` already carries: never the answer.
+            if not self.any_text and payload.get("text") and not payload.get("is_error"):
                 evs += self._handle("text", payload["text"])
         return evs
 

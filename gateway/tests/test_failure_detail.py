@@ -12,6 +12,7 @@ import sys
 import time
 
 import jsonschema
+import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 os.environ.setdefault("HR_BACKING", "local")
@@ -151,6 +152,7 @@ def test_the_whole_path_names_the_base_and_the_tool_and_keeps_the_exception(monk
     assert err["type"] == "harness_error" and err["code"] == "turn_failed"
     assert err["detail"] == {"base": "claude", "tool": "Bash"}
     assert "the CLI own sentence" in err["message"]
+    assert not [o for o in tr.output if o.get("type") == "message"]   # said once, as the error
     # the trace keeps the harness's own account of the failure, exception and stack frames whole
     result_ev = [ev for ev in traced if ev.get("type") == "result"]
     assert result_ev and "ValueError: the tool blew up" in result_ev[-1]["error_detail"]["exception"]
@@ -188,4 +190,64 @@ def test_a_result_with_the_failure_as_error_adds_no_answer():
     assert not [o for o in tr.output if o.get("type") == "message"]
     said = gw._RespTranslator("resp_said", "m", None, False, 0.0)
     said.feed({**made, "result": "ValueError: the tool blew up", "error": None})
-    assert said.any_text      # what the reason in `result` did: an answer the agent never gave
+    assert not said.any_text   # the reason in `result` is not an answer the agent gave either
+    assert not [o for o in said.output if o.get("type") == "message"]
+
+
+# ── a CLI's own failed result, as each base's normaliser hands it over ─────────────────────────
+# The result events of three failed turns, read back from a Community Edition instance's trace
+# (`GET /v1/traces/{sid}/all`, image of 2026-11-20) with the provider answering 500 or 400.
+# Codex's is its retry log, Claude Code's the "API Error" line _strip_claude_error_text keeps out
+# of the answer, OpenCode's the provider's message.
+_CODEX_RETRIES = "\n".join(
+    [f"Reconnecting... {i}/5 (We're currently experiencing high demand, which may cause temporary errors.)"
+     for i in range(1, 6)] + ["We're currently experiencing high demand, which may cause temporary errors."])
+_CLI_FAILED_RESULTS = {
+    "codex": {"type": "result", "subtype": "error", "is_error": True, "result": _CODEX_RETRIES, "usage": {}},
+    "claude": {"type": "result", "subtype": "success", "is_error": True,
+               "result": "API Error: 400 stub forced 400", "stop_reason": "stop_sequence"},
+    "opencode": {"type": "result", "subtype": "error", "is_error": True, "result": "stub forced 500", "usage": {}},
+}
+
+
+def _failed_turn(result: dict, before: list[dict] = ()) -> tuple[gw._RespTranslator, list[dict]]:
+    """Feed a failed turn's events and close it the way create_response closes a failed turn."""
+    tr = gw._RespTranslator("resp_cli", "m", None, False, 0.0)
+    events = tr.start()
+    for ev in [*before, result]:
+        events += tr.feed(ev)
+    events += gw._fail_events(tr, {"backend": "codex", "tried": [
+        {"connection": "c", "status": "failed", "error": str(result.get("result") or "")}]})
+    return tr, events
+
+
+def _answer(tr: gw._RespTranslator) -> str:
+    """What a client reads as the reply: the text of the response's message items (output_text)."""
+    return "".join(c.get("text") or "" for o in tr.output if o.get("type") == "message"
+                   for c in o.get("content") or [])
+
+
+@pytest.mark.parametrize("base", sorted(_CLI_FAILED_RESULTS))
+def test_a_cli_failed_result_is_not_drawn_as_the_answer(base):
+    result = _CLI_FAILED_RESULTS[base]
+    tr, events = _failed_turn(result)
+    assert _answer(tr) == ""
+    assert not [e for e in events if e["type"].startswith(("response.output_text", "response.content_part"))]
+    assert events[-1]["type"] == "response.failed" and events[-1]["response"]["output"] == []
+    assert result["result"].splitlines()[0] in tr.error["message"]   # the reason is said once, as the error
+
+
+def test_what_the_agent_said_before_it_failed_is_kept():
+    """A turn that answered and then failed keeps the answer it streamed; the reason is the error's."""
+    said = {"type": "assistant", "message": {"content": [{"type": "text", "text": "Half of the summary"}]}}
+    tr, _ = _failed_turn(_CLI_FAILED_RESULTS["opencode"], [said])
+    assert _answer(tr) == "Half of the summary"
+    assert "stub forced 500" in tr.error["message"]
+
+
+def test_a_successful_result_with_nothing_said_before_is_still_the_answer():
+    """Claude's stream-json can carry the final text on the result alone; that stays the answer."""
+    tr = gw._RespTranslator("resp_ok", "m", None, False, 0.0)
+    tr.feed({"type": "result", "subtype": "success", "is_error": False, "result": "it works.", "usage": {}})
+    tr.complete("completed")
+    assert _answer(tr) == "it works."
