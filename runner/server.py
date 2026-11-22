@@ -2559,13 +2559,18 @@ def _strip_claude_error_text(obj: dict, state: dict | None = None) -> dict | Non
     content = (obj.get("message") or {}).get("content")
     if not isinstance(content, list):
         return obj
+    # The CLI's own report of an error ("Failed to authenticate. …", "There's an issue with the selected
+    # model …") need not start "API Error:", but it is marked: model "<synthetic>" and the error's kind.
+    made = bool(obj.get("error")) and (obj.get("message") or {}).get("model") == "<synthetic>"
+
+    def is_error_text(c) -> bool:
+        return (isinstance(c, dict) and c.get("type") == "text"
+                and (made or bool(_CLAUDE_ERR_RE.match(str(c.get("text") or "")))))
     if state is not None:
         for c in content:
-            if isinstance(c, dict) and c.get("type") == "text" and _CLAUDE_ERR_RE.match(str(c.get("text") or "")):
+            if is_error_text(c):
                 state["_cli_error"] = str(c.get("text") or "").strip().strip("[]").strip()[:400]
-    kept = [c for c in content
-            if not (isinstance(c, dict) and c.get("type") == "text"
-                    and _CLAUDE_ERR_RE.match(str(c.get("text") or "")))]
+    kept = [c for c in content if not is_error_text(c)]
     if len(kept) == len(content):
         return obj                      # no error block — untouched
     if not kept:

@@ -85,6 +85,43 @@ def test_a_real_answer_after_a_retried_error_keeps_the_answer():
     assert out == [{"type": "result", "subtype": "success", "result": "Hello", "is_error": False}]
 
 
+def _made(kind, text):
+    """A message Claude Code writes itself to report an error, as it streams one (read back from a
+    Community Edition trace, Claude Code 2.1.311, the provider answering 401 / 404)."""
+    return {"type": "assistant", "error": kind,
+            "message": {"model": "<synthetic>", "content": [{"type": "text", "text": text}]}}
+
+
+def test_the_clis_own_error_message_is_dropped_even_without_a_leading_api_error():
+    for kind, text in (("authentication_failed", "Failed to authenticate. API Error: 401 stub forced 401"),
+                       ("model_not_found", "There's an issue with the selected model (claude-sonnet-4-6). "
+                        "It may not exist or you may not have access to it. Run --model to pick a different model.")):
+        state = {}
+        assert rn._claude_passthrough(_made(kind, text), state) == [], kind
+        assert state["_cli_error"] == text, kind        # kept aside as the turn's reason
+        res = {"type": "result", "subtype": "success", "is_error": True, "result": text}
+        assert rn._claude_passthrough(res, state)[0]["is_error"] is True, kind
+
+
+def test_a_model_reply_that_names_an_error_kind_is_kept():
+    """Only the CLI's own messages carry model "<synthetic>": a reply the model wrote stays whole,
+    and so does a synthetic message with no error on it."""
+    ev = {"type": "assistant", "error": "max_output_tokens",
+          "message": {"model": "claude-sonnet-4-6", "content": [{"type": "text", "text": "Half of the summary"}]}}
+    assert rn._claude_passthrough(ev, {}) == [ev]
+    plain = {"type": "assistant", "message": {"model": "<synthetic>", "content": [{"type": "text", "text": "No response requested."}]}}
+    assert rn._claude_passthrough(plain, {}) == [plain]
+
+
+def test_a_real_answer_after_the_clis_own_error_message_keeps_the_answer():
+    state = {"partial": True}
+    rn._claude_passthrough(_made("rate_limit", "API rate limit reached, retrying"), state)
+    delta = {"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hello"}}}
+    rn._claude_passthrough(delta, state)
+    out = rn._claude_passthrough({"type": "result", "subtype": "success", "result": "", "is_error": False}, state)
+    assert out == [{"type": "result", "subtype": "success", "result": "Hello", "is_error": False}]
+
+
 def test_a_resume_the_builder_could_not_honor_is_reported_not_silent():
     """claude and opencode start fresh when the session is not in the workspace; the turn then
     opens with the resume_lost note the gateway renders (hermes already sends it, codex its own)."""
